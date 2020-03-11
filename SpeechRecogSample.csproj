@@ -23,7 +23,8 @@
   <Target Name="CompileDependentLibrary" BeforeTargets="Restore">
     <!-- Todo: nupkgファイルが既に生成されていたらスキップ -->
     <!-- https://docs.microsoft.com/en-us/visualstudio/msbuild/property-functions -->
-    <Exec Command="dotnet restore Docker.DotNet; dotnet publish -f netstandard2.0 $([MSBuild]::NormalizePath('Docker.DotNet', 'src', 'Docker.DotNet'))" />
+    <Exec Command="dotnet restore Docker.DotNet" />
+    <Exec Command="dotnet publish -f netstandard2.0 $([MSBuild]::NormalizePath('Docker.DotNet', 'src', 'Docker.DotNet'))" />
   </Target>
 
 </Project>
