@@ -3,13 +3,27 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>netcoreapp3.1</TargetFramework>
+    <!-- Localのnupkgを優先する -->
+    <RestoreSources>Docker.DotNet\src\Docker.DotNet\bin;$(RestoreSources);</RestoreSources>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="CommandLineParser" Version="2.6.0" />
     <PackageReference Include="CsvHelper" Version="12.2.2" />
+    <PackageReference Include="Docker.DotNet" Version="3.125.3" />
     <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.8.0" />
     <PackageReference Include="System.Reactive" Version="4.3.2" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Docker.DotNet\**" />
+  </ItemGroup>
+
+  <!-- Restore前にBuildを終わらせないと、Restoreが出来ない -->
+  <Target Name="CompileDependentLibrary" BeforeTargets="Restore">
+    <!-- Todo: nupkgファイルが既に生成されていたらスキップ -->
+    <!-- https://docs.microsoft.com/en-us/visualstudio/msbuild/property-functions -->
+    <Exec Command="dotnet restore Docker.DotNet; dotnet publish -f netstandard2.0 $([MSBuild]::NormalizePath('Docker.DotNet', 'src', 'Docker.DotNet'))" />
+  </Target>
 
 </Project>
