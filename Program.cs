@@ -54,7 +54,7 @@ namespace SpeechRecogSample
             var client = new DockerClientConfiguration().CreateClient();
             var createContainerResponse = await client.Containers.CreateContainerAsync(new CreateContainerParameters
             {
-                Cmd = new[] { "mecab", Path.Combine(TempDirInDocker, InputFileName), "-o", Path.Combine(TempDirInDocker, OutputFileName) },
+                Cmd = new[] { "mecab", $"{TempDirInDocker}/{InputFileName}", "-o", $"{TempDirInDocker}/{OutputFileName}" },
                 Image = "intimatemerger/mecab-ipadic-neologd",
                 HostConfig = new HostConfig
                 {
