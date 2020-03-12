@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -21,6 +21,7 @@ namespace SpeechRecogSample
         readonly static string InputFileName = "input.txt";
         readonly static string OutputFileName = "output.txt";
         readonly static string TempDirInDocker = "/tmp";
+        readonly static string AnalysisImageName = "intimatemerger/mecab-ipadic-neologd";
 
         static SpeechConfig InitializeSpeechConfig(string endpoint, string subscriptionKey) =>
             SpeechConfig.FromEndpoint(new Uri(endpoint), subscriptionKey).Also(m =>
@@ -52,10 +53,30 @@ namespace SpeechRecogSample
         {
             var tempDir = CreateRandomTempDirectory();
             var client = new DockerClientConfiguration().CreateClient();
+
+            var images = await client.Images.ListImagesAsync(new ImagesListParameters
+            {
+                MatchName = AnalysisImageName,
+            });
+
+            if (images.Count == 0)
+            {
+                Console.WriteLine($"start pull image: {AnalysisImageName}");
+                await client.Images.CreateImageAsync(new ImagesCreateParameters
+                {
+                    FromImage = AnalysisImageName,
+                    Tag = "latest",
+                }, null, new Progress<JSONMessage>((_) =>
+                {
+                    Console.Write(".");
+                }));
+                Console.WriteLine($"finish pull image: {AnalysisImageName}");
+            }
+
             var createContainerResponse = await client.Containers.CreateContainerAsync(new CreateContainerParameters
             {
                 Cmd = new[] { "mecab", $"{TempDirInDocker}/{InputFileName}", "-o", $"{TempDirInDocker}/{OutputFileName}" },
-                Image = "intimatemerger/mecab-ipadic-neologd",
+                Image = AnalysisImageName,
                 HostConfig = new HostConfig
                 {
                     Mounts = new[]{new Mount
