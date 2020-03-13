@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,6 +13,7 @@ using Docker.DotNet.Models;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Collections.Concurrent;
 
 namespace SpeechRecogSample
 {
@@ -35,7 +36,7 @@ namespace SpeechRecogSample
             await File.WriteAllTextAsync(Path.Combine(mountDir, InputFileName), text, Encoding.UTF8);
 
             await client.Containers.StartContainerAsync(containerId, new ContainerStartParameters());
-            
+
             while (true)
             {
                 var s = await client.Containers.InspectContainerAsync(containerId);
@@ -88,11 +89,12 @@ namespace SpeechRecogSample
                 }
             });
             var containerId = createContainerResponse.ID;
-            
+
             var config = InitializeSpeechConfig(opts.Endpoint, opts.SubscriptionKey);
             var resultList = new List<RecognitionResult>();
             var recognitionRunningSubject = new BehaviorSubject<bool>(false);
             var resultSubject = new Subject<RecognitionResult>();
+            var runningQueue = new ConcurrentQueue<bool>();
             using var _ = resultSubject.Subscribe(async (r) =>
             {
                 var result = await GetAnalysisResultAsync(client, containerId, tempDir, r.RawResult);
@@ -100,23 +102,26 @@ namespace SpeechRecogSample
                 {
                     resultList.Add(r);
                     Console.WriteLine($"{r.File}: {r.Result} ({r.Confidence}/1.0)");
+                    runningQueue.TryDequeue(out bool _);
                     return;
                 }
                 var filteredText = result.Where(s => (s.Split('\t').Skip(1).FirstOrDefault() ?? "").Split(',').FirstOrDefault() != "感動詞")
                     .Where(s => !s.StartsWith("EOS"))
                     .Select(s => s.Split('\t').FirstOrDefault() ?? "").Aggregate((a, b) => a + b);
-                var newResult = r.Also(a => {
+                var newResult = r.Also(a =>
+                {
                     a.Result = filteredText;
                 });
                 resultList.Add(newResult);
                 Console.WriteLine($"{newResult.File}: {newResult.Result} ({newResult.Confidence}/1.0)");
+                runningQueue.TryDequeue(out bool _);
             });
 
             foreach (var f in Directory.EnumerateFiles(Path.GetFullPath(opts.SourceDir), "*.wav")
                         .OrderBy((f) => Path.GetFileName(f)))
             {
                 recognitionRunningSubject.OnNext(false);
-
+                runningQueue.Append(true);
                 using var audioConfig = AudioConfig.FromWavFileInput(f);
                 using var recognizer = new SpeechRecognizer(config, audioConfig).Also(r =>
                 {
@@ -146,7 +151,20 @@ namespace SpeechRecogSample
 
                 await recognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
             }
-
+            
+            while (!runningQueue.IsEmpty)
+            {
+                await Task.Delay(200);
+            }
+            while (true)
+            {
+                var s = await client.Containers.InspectContainerAsync(containerId);
+                if (!s.State.Running)
+                {
+                    break;
+                }
+                await Task.Delay(200);
+            }
             if (string.IsNullOrEmpty(opts.Result))
             {
                 return;
