@@ -8,11 +8,22 @@ using CommandLine;
 using CsvHelper;
 using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
+using Docker.DotNet;
+using Docker.DotNet.Models;
+using System.Reactive.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Collections.Concurrent;
 
 namespace SpeechRecogSample
 {
     class Program
     {
+        readonly static string InputFileName = "input.txt";
+        readonly static string OutputFileName = "output.txt";
+        readonly static string TempDirInDocker = "/tmp";
+        readonly static string AnalysisImageName = "intimatemerger/mecab-ipadic-neologd";
+
         static SpeechConfig InitializeSpeechConfig(string endpoint, string subscriptionKey) =>
             SpeechConfig.FromEndpoint(new Uri(endpoint), subscriptionKey).Also(m =>
             {
@@ -20,23 +31,97 @@ namespace SpeechRecogSample
                 m.OutputFormat = OutputFormat.Detailed;
             });
 
+        static async Task<IEnumerable<string>> GetAnalysisResultAsync(DockerClient client, string containerId, string mountDir, string text)
+        {
+            await File.WriteAllTextAsync(Path.Combine(mountDir, InputFileName), text, Encoding.UTF8);
+
+            await client.Containers.StartContainerAsync(containerId, new ContainerStartParameters());
+
+            while (true)
+            {
+                var s = await client.Containers.InspectContainerAsync(containerId);
+                if (!s.State.Running)
+                {
+                    break;
+                }
+                await Task.Delay(200);
+            }
+
+            return await File.ReadAllLinesAsync(Path.Combine(mountDir, OutputFileName), Encoding.UTF8);
+        }
+
         static async Task SpeechContinuousRecognitionAsync(Options opts)
         {
+            var tempDir = CreateRandomTempDirectory();
+            var client = new DockerClientConfiguration().CreateClient();
+
+            var images = await client.Images.ListImagesAsync(new ImagesListParameters
+            {
+                MatchName = AnalysisImageName,
+            });
+
+            if (images.Count == 0)
+            {
+                Console.WriteLine($"start pull image: {AnalysisImageName}");
+                await client.Images.CreateImageAsync(new ImagesCreateParameters
+                {
+                    FromImage = AnalysisImageName,
+                    Tag = "latest",
+                }, null, new Progress<JSONMessage>((_) =>
+                {
+                    Console.Write(".");
+                }));
+                Console.WriteLine($"finish pull image: {AnalysisImageName}");
+            }
+
+            var createContainerResponse = await client.Containers.CreateContainerAsync(new CreateContainerParameters
+            {
+                Cmd = new[] { "mecab", $"{TempDirInDocker}/{InputFileName}", "-o", $"{TempDirInDocker}/{OutputFileName}" },
+                Image = AnalysisImageName,
+                HostConfig = new HostConfig
+                {
+                    Mounts = new[]{new Mount
+                    {
+                        Source = tempDir,
+                        Target = TempDirInDocker,
+                        Type = "bind"
+                    }}
+                }
+            });
+            var containerId = createContainerResponse.ID;
+
             var config = InitializeSpeechConfig(opts.Endpoint, opts.SubscriptionKey);
             var resultList = new List<RecognitionResult>();
             var recognitionRunningSubject = new BehaviorSubject<bool>(false);
             var resultSubject = new Subject<RecognitionResult>();
-            using var _ = resultSubject.Subscribe((r) =>
+            var runningQueue = new ConcurrentQueue<bool>();
+            using var _ = resultSubject.Subscribe(async (r) =>
             {
-                resultList.Add(r);
-                Console.WriteLine($"{r.File}: {r.Result} ({r.Confidence}/1.0)");
+                var result = await GetAnalysisResultAsync(client, containerId, tempDir, r.RawResult);
+                if (result.Count() == 0)
+                {
+                    resultList.Add(r);
+                    Console.WriteLine($"{r.File}: {r.Result} ({r.Confidence}/1.0)");
+                    runningQueue.TryDequeue(out bool _);
+                    return;
+                }
+                var filteredText = result.Where(s => (s.Split('\t').Skip(1).FirstOrDefault() ?? "").Split(',').FirstOrDefault() != "感動詞")
+                    .Where(s => !s.StartsWith("EOS"))
+                    .Select(s => s.Split('\t').FirstOrDefault() ?? "").Aggregate((a, b) => a + b);
+                var newResult = r.Also(a =>
+                {
+                    a.Result = filteredText;
+                });
+                resultList.Add(newResult);
+                Console.WriteLine($"{newResult.File}: {newResult.Result} ({newResult.Confidence}/1.0)");
+                runningQueue.TryDequeue(out bool _);
             });
 
             foreach (var f in Directory.EnumerateFiles(Path.GetFullPath(opts.SourceDir), "*.wav")
                         .OrderBy((f) => Path.GetFileName(f)))
             {
                 recognitionRunningSubject.OnNext(false);
-
+                runningQueue.Append(true);
                 using var audioConfig = AudioConfig.FromWavFileInput(f);
                 using var recognizer = new SpeechRecognizer(config, audioConfig).Also(r =>
                 {
@@ -48,6 +133,7 @@ namespace SpeechRecogSample
                             {
                                 File = f,
                                 Result = r.Text,
+                                RawResult = r.Text,
                                 Confidence = r.Confidence,
                             }));
                         }
@@ -65,7 +151,20 @@ namespace SpeechRecogSample
 
                 await recognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
             }
-
+            
+            while (!runningQueue.IsEmpty)
+            {
+                await Task.Delay(200);
+            }
+            while (true)
+            {
+                var s = await client.Containers.InspectContainerAsync(containerId);
+                if (!s.State.Running)
+                {
+                    break;
+                }
+                await Task.Delay(200);
+            }
             if (string.IsNullOrEmpty(opts.Result))
             {
                 return;
@@ -74,6 +173,16 @@ namespace SpeechRecogSample
             using var writer = new StreamWriter(opts.Result);
             using var csv = new CsvWriter(writer);
             csv.WriteRecords(resultList);
+
+            await client.Containers.RemoveContainerAsync(containerId, new ContainerRemoveParameters());
+        }
+
+        static string CreateRandomTempDirectory()
+        {
+            var platformDependentMountableTempBaseDir = RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "/tmp" : Path.GetTempPath();
+            var randomTempDir = Path.GetFullPath(Path.Combine(platformDependentMountableTempBaseDir, Guid.NewGuid().ToString()));
+            Directory.CreateDirectory(randomTempDir);
+            return randomTempDir;
         }
 
         static void Main(string[] args)
@@ -102,6 +211,7 @@ namespace SpeechRecogSample
         {
             public string File { get; set; }
             public string Result { get; set; }
+            public string RawResult { get; set; }
             public double Confidence { get; set; }
         }
     }
